@@ -1,0 +1,6 @@
+*.d.ts
+*.js
+# Ignore artifacts:
+node_modules
+cypress/temp
+cypress/fixtures

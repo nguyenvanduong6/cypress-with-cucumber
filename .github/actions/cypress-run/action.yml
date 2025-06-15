@@ -1,0 +1,221 @@
+name: 'Cypress Run'
+description: 'Run cypress check and report in Slack'
+inputs:
+  SLACK_WEBHOOK_URL:
+    description: 'Webhook URL for Slack when sending the message to specific channel'
+    required: true
+  SHELL_TYPE:
+    description: 'Shell type depend on OS where the code is running on'
+    required: true
+  OS_RUN:
+    description: 'OS name which running on'
+    required: true
+  BROWSER_RUN:
+    description: 'Which browser will be used for trigger this action'
+    required: true
+    default: 'chrome'
+  RUN_ALL:
+    description: 'Run all Specs or run specific Specs'
+    required: true
+    default: false
+  RUN_SPECS:
+    description: 'Specs defined for running action'
+    required: false
+    default: ''
+  ENV_CONTENT:
+    required: true
+    description: 'The secret ENV content to build CI env'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Print specs changed against the parent of this branch 🌳
+      id: check-file-changed
+      if: ${{ inputs.RUN_ALL == 'false' && inputs.RUN_SPECS == '' }}
+      env:
+        BASE_BRANCH: ${{ github.base_ref }}
+      shell: ${{ inputs.SHELL_TYPE }}
+      run: |
+        echo "Base branch is $BASE_BRANCH"
+        git fetch origin $BASE_BRANCH
+        (git merge-base --fork-point origin/$BASE_BRANCH HEAD) || true      
+        npm run find-file-changed
+    
+    - name: Copy ENV from secret to env.ci file
+      id: copy_env
+      shell: ${{ inputs.SHELL_TYPE }}
+      run: |
+        echo "$ENV_CONTENT" >> .env.ci
+        cat .env.ci
+      env:
+        ENV_CONTENT: ${{ inputs.ENV_CONTENT }}
+
+    - name: Run E2E with specific specs option (by code)
+      id: runE2EWithOption
+      if: ${{ inputs.RUN_ALL == 'false' && steps.check-file-changed.outputs.changedSpecsN > 0}}
+      shell: ${{ inputs.SHELL_TYPE }}
+      run: |
+        echo ${{ steps.check-file-changed.outputs.changedSpecsN }} ${{ steps.check-file-changed.outputs.changedSpecs }}      
+        (npm run cypress:run-ci -- --browser ${{ inputs.BROWSER_RUN }} --spec ${{ steps.check-file-changed.outputs.changedSpecs }}) || true
+
+    - name: Run E2E with specific specs by trigger
+      id: runE2EWithOptionManual
+      if: ${{ inputs.RUN_ALL == 'false' && inputs.RUN_SPECS != '' }}
+      shell: ${{ inputs.SHELL_TYPE }}
+      run: |
+        echo ${{ inputs.RUN_SPECS }}      
+        (npm run cypress:run-ci -- --browser ${{ inputs.BROWSER_RUN }} --spec ${{ inputs.RUN_SPECS }}) || true
+
+    - name: Run E2E with run all specs option
+      id: runE2EWithAllSpecs
+      if: inputs.RUN_ALL == 'Run all'
+      shell: ${{ inputs.SHELL_TYPE }}
+      run: |
+        (npm run cypress:run-ci -- --browser ${{ inputs.BROWSER_RUN }}) || true
+
+    # - name: Test Report
+    #   uses: phoenix-actions/test-reporting@v8
+    #   id: test-report # Set ID reference for step
+    #   if: ${{ steps.runE2EWithOption.outcome == 'success' || steps.runE2EWithOptionManual.outcome == 'success' || steps.runE2EWithAllSpecs.outcome == 'success' }}
+    #   with:
+    #     name: ${{ inputs.OS_RUN }} (${{ inputs.BROWSER_RUN }}) - test results # Name of the check run which will be created
+    #     path: cypress/reports/*.json # Path to test results
+    #     reporter: mochawesome-json # Format of test results
+    #     fail-on-error: 'false'
+
+    - name: Bash - Cucumeber HTML export
+      id: cucumber-export-ubuntu
+      if: ${{ steps.runE2EWithOption.outcome == 'success' || steps.runE2EWithOptionManual.outcome == 'success' || steps.runE2EWithAllSpecs.outcome == 'success'}}
+      env:
+        GITHUB_SHA: ${{ github.sha }}
+      run: |
+        npm run generate-report
+
+        function format_seconds() {
+        (($1 >= 86400)) && printf '%d days and ' $(($1 / 86400)) # days
+        (($1 >= 3600)) && printf '%02d:' $(($1 / 3600 % 24))     # hours
+        (($1 >= 60)) && printf '%02d:' $(($1 / 60 % 60))         # minutes
+        printf '%02d%s\n' $(($1 % 60)) "$( (($1 < 60 )) && echo ' s.' || echo '')"
+        }
+
+        suites=$(jq .totalSuites cypress/run/results.json)
+        tests=$(jq .totalTests cypress/run/results.json)
+        passes=$(jq .totalPassed cypress/run/results.json)
+        pending=$(jq .totalPending cypress/run/results.json) 
+        failures=$(jq .totalFailed cypress/run/results.json) 
+        duration=$(format_seconds $(jq .totalDuration cypress/run/results.json)/1000)
+        skipped=$(jq .totalSkipped cypress/run/results.json) 
+        passPercent=$(jq -r '(.totalPassed / .totalTests * 10000 | floor) / 100' cypress/run/results.json)
+
+        echo "suites=$suites" >> "$GITHUB_ENV"
+        echo "tests=$tests" >> "$GITHUB_ENV"          
+        echo "passes=$passes" >> "$GITHUB_ENV"                 
+        echo "pending=$pending" >> "$GITHUB_ENV"               
+        echo "failures=$failures" >> "$GITHUB_ENV"           
+        echo "duration=$duration" >> "$GITHUB_ENV"                 
+        echo "skipped=$skipped" >> "$GITHUB_ENV"                     
+        echo "passPercent=$passPercent" >> "$GITHUB_ENV"
+      shell: ${{ inputs.SHELL_TYPE }}
+
+    - name: Config AWS Credential
+      if: ${{ steps.cucumber-export-ubuntu.outcome == 'success' }}
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        role-to-assume: arn:aws:iam::{aws account id}:role/{role name}
+        aws-region: ap-southeast-1
+
+    - name: Deploy to S3
+      shell: ${{ inputs.SHELL_TYPE }}    
+      if: ${{ steps.cucumber-export-ubuntu.outcome == 'success' }}
+      run: |
+        aws s3 cp --recursive --metadata-directive REPLACE cypress/reports/$GITHUB_SHA s3:{folder s3 bucket}/$GITHUB_SHA
+
+    - name: Test Report Name
+      id: set-slack-name
+      run: | 
+        if [ "${{ github.event_name }}" != "pull_request" ]; then
+          echo "text=*:bar_chart: Overview Report*" >> "$GITHUB_OUTPUT"
+        else
+          url="${{ github.event.pull_request.html_url }}"
+          title="${{ github.event.pull_request.title }}"
+          sha="${{ github.event.pull_request.head.sha }}"
+          user="${{ github.event.pull_request.user.login }}"
+          echo "text=*<${url}|${title}>*\nCreated by *<${url}/commits/${sha}|${user}>*" >> "$GITHUB_OUTPUT"
+        fi
+      shell: ${{ inputs.SHELL_TYPE }}
+
+    - name: Slack Report
+      id: slack
+      if: ${{ steps.cucumber-export-ubuntu.outcome == 'success' && steps.set-slack-name.outcome == 'success' }}
+      uses: slackapi/slack-github-action@v1.23.0
+      with:
+        payload: |
+          {
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "${{ steps.set-slack-name.outputs.text }}"
+                }
+              },
+              {
+                "type": "section",
+                "fields": [
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Total:* ${{ env.tests }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Passes:* ${{ env.passes }}/${{ env.tests }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Duration:* ${{ env.duration }}"
+                  },                                        
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Failed:* ${{ env.failures }}/${{ env.tests }}"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Coverage:* ${{ env.passPercent }}%"
+                  },
+                  {
+                    "type": "mrkdwn",
+                    "text": "*Skipped:* ${{ env.pending }}/${{ env.tests }}"
+                  }
+                ]
+              },
+              {
+                "type": "actions",
+                "elements": [
+                  {
+                    "type": "button",
+                    "text": {
+                      "type": "plain_text",
+                      "text": "${{ inputs.OS_RUN }} (${{ inputs.BROWSER_RUN }})",
+                      "emoji": true
+                    },
+                    "value": "click_me_123",
+                    "action_id": "actionId-0"
+                  },                              
+                  {
+                    "type": "button",
+                    "text": {
+                      "type": "plain_text",
+                      "emoji": true,
+                      "text": "Report Page"
+                    },
+                    "style": "${{ env.failures <= 0 && 'primary' || 'danger'}}",
+                    "value": "view_report",
+                    "url": "https://{domain}/${{ github.sha }}/index.html"
+                  }                  
+                ]
+              }                
+            ]
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ inputs.SLACK_WEBHOOK_URL }}
+        SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
